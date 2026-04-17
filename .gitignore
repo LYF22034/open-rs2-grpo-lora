@@ -3,25 +3,25 @@ __pycache__/
 
 *.pyc
 
-.cache/
-
-wandb/
-
-*.safetensors
-
-*.bin
+*.pth
 
 *.pt
 
-*.pth
+*.bin
 
-checkpoint-*/
+*.safetensors
+
+*.ckpt
+
+wandb/
 
 outputs/
 
 logs/
 
+.cache/
+
 *.egg-info/
 
-.eggs/
+*.bak
 

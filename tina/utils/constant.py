@@ -17,7 +17,8 @@ RL_POST_TRAIN_CONFIG_MAP = {
     # "fastcurl": "Nickyang/FastCuRL", # 80.6k
     "still": "RUC-AIBOX/STILL-3-Preview-RL-Data", # 33k
     "open_rs3": "knoveleng/open-rs", # 7k => combine s1 dataset and deepscaler
-    "open_rs2": "knoveleng/open-rs", # 7k => combine s1 dataset and deepscaler
+    "open_rs2": "knoveleng/open-rs",
+    "open_rs2_prime": "knoveleng/open-rs", # 7k => combine s1 dataset and deepscaler
     "open_rs1": "knoveleng/open-s1", # 18.6k => from s1 dataset
     # Extra datasets
     "limr": "GAIR/LIMR", # 1.39k

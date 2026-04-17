@@ -49,6 +49,7 @@ from trl.trainer.callbacks import SyncRefModelCallback
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
 
 from tina.post_train_hf.grpo_config import GRPOConfig
+from tina.post_train_hf.implicit_prm import ImplicitPRM
 
 
 if is_peft_available():
@@ -208,6 +209,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        implicit_prm: Optional["ImplicitPRM"] = None,
     ):
         # Args
         if args is None:
@@ -282,6 +284,11 @@ class GRPOTrainer(Trainer):
             self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
         else:
             self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
+
+        # Implicit PRM (PRIME)
+        self.implicit_prm = implicit_prm
+        if self.implicit_prm is not None:
+            print("[GRPOTrainer] PRIME enabled with Implicit PRM")
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -698,6 +705,85 @@ class GRPOTrainer(Trainer):
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
 
+        # ============ PRIME: Implicit Process Rewards ============
+        if self.implicit_prm is not None:
+            # Build full input for PRM
+            prm_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            prm_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            logits_to_keep_prm = completion_ids.size(1)
+
+            # Extract per-sample accuracy from the accuracy reward (first reward func)
+            # rewards_per_func[:, 0] is the accuracy reward (gathered across all processes)
+            accuracy_scores = rewards_per_func[process_slice, 0]  # (local_B,) — 0 or 1
+
+            # Update PRM online with CE loss
+            prm_metrics = self.implicit_prm.update(
+                input_ids=prm_input_ids,
+                attention_mask=prm_attention_mask,
+                completion_mask=completion_mask,
+                accuracy=accuracy_scores,
+                logits_to_keep=logits_to_keep_prm,
+                micro_batch_size=4,
+            )
+            for k, v in prm_metrics.items():
+                self._metrics[k].append(v)
+
+            # Compute token-level process rewards (after PRM update = "single forward")
+            # Note: compute_token_rewards returns CPU tensor (PRM lives on CPU)
+            token_rewards = self.implicit_prm.compute_token_rewards(
+                input_ids=prm_input_ids,
+                attention_mask=prm_attention_mask,
+                logits_to_keep=logits_to_keep_prm,
+            )  # (local_B, C) on CPU
+
+            # Compute GRPO-style process advantage (Eq. 7 from PRIME paper)
+            # Normalize process rewards per group (same as GRPO normalizes outcome rewards)
+            G = self.num_generations
+            B_local = token_rewards.size(0)
+            n_prompts = B_local // G
+
+            # Compute average process reward per completion
+            compl_lengths = completion_mask.sum(dim=1).clamp(min=1)  # (local_B,)
+            avg_proc_reward = (token_rewards * completion_mask.to(token_rewards.device)).sum(dim=1) / compl_lengths.to(token_rewards.device)  # (local_B,)
+
+            # Group-wise mean and std of average process rewards
+            avg_grouped = avg_proc_reward.view(n_prompts, G)
+            mean_grouped_proc = avg_grouped.mean(dim=1).repeat_interleave(G)  # (local_B,)
+            std_grouped_proc = avg_grouped.std(dim=1).repeat_interleave(G)  # (local_B,)
+
+            # Normalize token rewards and compute discounted return (gamma=1)
+            normalized_token_rewards = torch.zeros_like(token_rewards)
+            for t in range(token_rewards.size(1)):
+                normalized_token_rewards[:, t] = (
+                    token_rewards[:, t] - mean_grouped_proc.to(token_rewards.device)
+                ) / (std_grouped_proc.to(token_rewards.device) + 1e-4)
+
+            # Discounted return from each token position (gamma=1 means just cumulative sum from t to T)
+            process_advantages = torch.zeros_like(normalized_token_rewards)
+            running_sum = torch.zeros(B_local, device=token_rewards.device)
+            for t in reversed(range(token_rewards.size(1))):
+                running_sum = normalized_token_rewards[:, t] + running_sum
+                process_advantages[:, t] = running_sum
+
+            # Mask by completion_mask
+            process_advantages = process_advantages * completion_mask.to(process_advantages.device)
+
+            # Combine: outcome advantage (scalar, broadcast) + process advantage (token-level)
+            # advantages is (local_B,) from GRPO, expand to (local_B, C)
+            combined_advantages = advantages.unsqueeze(1).to(process_advantages.device) + process_advantages
+            combined_advantages = combined_advantages.to(advantages.device)
+
+            # Whiten combined advantages (critical for numerical stability)
+            # This is what PRIME's compute_rloo_returns does: masked_whiten
+            cm = completion_mask.to(combined_advantages.device).bool()
+            valid_advs = combined_advantages[cm]
+            if valid_advs.numel() > 1:
+                combined_advantages = (combined_advantages - valid_advs.mean()) / (valid_advs.std() + 1e-8)
+            combined_advantages = combined_advantages * cm.float()
+        else:
+            combined_advantages = advantages.unsqueeze(1).expand(-1, completion_ids.size(1))
+        # ============ END PRIME ============
+
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -705,7 +791,7 @@ class GRPOTrainer(Trainer):
             "completion_mask": completion_mask,
 
             "ref_per_token_logps": ref_per_token_logps,
-            "advantages": advantages,
+            "advantages": combined_advantages,
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -727,7 +813,12 @@ class GRPOTrainer(Trainer):
 
         # x - x.detach() allows for preserving gradients from x
         advantages = inputs["advantages"]
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        # advantages may be (B, C) from PRIME or (B,) from standard GRPO
+        if advantages.dim() == 1:
+            advantages_expanded = advantages.unsqueeze(1)
+        else:
+            advantages_expanded = advantages
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages_expanded
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
 
         if self.args.scale_rewards:

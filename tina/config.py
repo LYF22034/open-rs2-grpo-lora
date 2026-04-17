@@ -21,6 +21,11 @@ class ModelPTConfig:
     repetition_n_grams: int = field(default=3)
     repetition_max_penalty: float = field(default=-1.0)
 
+    # PRIME (Implicit PRM) configs
+    use_implicit_prm: bool = field(default=False)
+    prm_beta: float = field(default=0.05)
+    prm_lr: float = field(default=1e-6)
+
 
 # check ./recipes/BASE_MODEL_NAME/PT_TYPE/train_sae_XXXX.yaml
 @dataclass

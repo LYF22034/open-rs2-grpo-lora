@@ -32,6 +32,7 @@ from tina.post_train_hf.rewards import (
 from tina.utils.chat_template import DEFAULT_CHAT_TEMPLATE, REASON_CHAT_TEMPLATE
 from tina.utils.constant import RL_POST_TRAIN_CONFIG_MAP
 from tina.utils.prompt import OPEN_R1_SYSTEM_PROMPT, OPEN_RS_SYSTEM_PROMPT
+from tina.post_train_hf.implicit_prm import ImplicitPRM
 
 
 def main():
@@ -224,13 +225,29 @@ def main():
             # PushToHubRevisionCallback(dataset_name=pt_args.model_post_train_dataset_name, use_peft=model_args.use_peft)
         ]
 
+    # Initialize Implicit PRM if enabled via config
+    implicit_prm = None
+    if getattr(pt_args, 'use_implicit_prm', False):
+        prm_device = "cuda:0"  # PRM time-shares with policy GPU
+        implicit_prm = ImplicitPRM(
+            model_name_or_path=model_args.model_name_or_path,  # same base model
+            beta=getattr(pt_args, 'prm_beta', 0.05),
+            lr=getattr(pt_args, 'prm_lr', 1e-6),
+            device=prm_device,
+        )
+        logger.info(f"\n[PRIME] Implicit PRM initialized from {model_args.model_name_or_path}")
+        logger.info(f"[PRIME] beta={pt_args.prm_beta}, lr={pt_args.prm_lr}, device={prm_device}")
+    else:
+        logger.info("\n[PRIME] Implicit PRM disabled (standard GRPO mode)")
+
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
         reward_funcs=rl_reward_funcs,
         args=training_args,
         train_dataset=train_dataset,
-        callbacks=callbacks)
+        callbacks=callbacks,
+        implicit_prm=implicit_prm)
 
     #########################
     # Training and Evaluation
